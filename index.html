@@ -1211,7 +1211,8 @@
             if (!indicator) return;
             indicator.innerText = message;
             if (autosaveTimer) clearTimeout(autosaveTimer);
-            if (message !== 'Saved') {
+            const isTransient = message === 'Saving...' || message.startsWith('Saved ');
+            if (isTransient) {
                 autosaveTimer = setTimeout(() => { indicator.innerText = 'Saved'; }, 1400);
             }
         }
@@ -1240,9 +1241,20 @@
             record.matchScores = matchScores;
             record.lastUpdated = new Date().toLocaleString();
 
-            localStorage.setItem('tournament_history_v3', JSON.stringify(tournamentHistory));
-            localStorage.setItem('active_tournament_id', activeId);
-            setAutosaveStatus(`Saved ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+            try {
+                localStorage.setItem('tournament_history_v3', JSON.stringify(tournamentHistory));
+                localStorage.setItem('active_tournament_id', activeId);
+                setAutosaveStatus(`Saved ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+            } catch (e) {
+                // Realistic at large player counts: Round Robin/Swiss/etc pre-populate a
+                // matchScores entry for every match as soon as it's rendered, so the saved
+                // payload grows with the player count and can exceed the browser's
+                // localStorage quota. The in-memory tournament state (players, matchScores)
+                // is already correct and rendered — only persistence failed — so we surface
+                // that clearly instead of throwing and silently aborting the caller.
+                console.error('Autosave failed:', e);
+                setAutosaveStatus('⚠️ Autosave failed (storage full)');
+            }
         }
 
         function beginPlayerSetup() {
@@ -1451,10 +1463,10 @@
             document.getElementById('setup-tourney-name').value = "";
             setupDraft = { name: "", format: "rr", winThreshold: 3, roster: [] };
             
-            autoSaveState();
             syncActiveTitles();
             buildAndRender(true);
             switchView('view-active-tournament');
+            autoSaveState();
         }
 
         function openHistoryDashboard() {
@@ -2030,12 +2042,13 @@
             let p = players.find(x => x.name === name);
             if (!p) return;
             p.isDQ = !p.isDQ;
-            autoSaveState();
             buildAndRender();
+            autoSaveState();
             if(document.getElementById('tree-modal').style.display === 'flex') openTreeModal();
         }
 
         function buildAndRender(refreshDropdown = false) {
+            invalidateComputeCache();
             const treeBtn = document.getElementById('view-tree-btn');
             if (currentFormat === 'rr') {
                 document.getElementById('filter-bar-container').style.display = 'flex';
@@ -2187,7 +2200,29 @@
             targetElement.appendChild(row);
         }
 
+        // --- Per-cycle compute cache -------------------------------------------------
+        // getSwissState/getSEState/getDEState/getAllActiveMatches are pure functions of
+        // (players, matchScores, currentFormat, winThreshold). A single UI update can
+        // trigger several consumers of the same computed state in one pass (schedule
+        // render, leaderboards, completion check, tree modal). Without caching, each of
+        // those consumers recomputes the full bracket/pairing/match-list from scratch,
+        // multiplying the cost on every score edit. This cache stores one result per
+        // state type and is invalidated at the start of every buildAndRender() cycle
+        // (the single funnel point all mutations pass through), so it can never return
+        // data older than the current players/matchScores snapshot.
+        let _computeCache = { swiss: null, se: null, de: null, activeMatches: null };
+        function invalidateComputeCache() {
+            _computeCache = { swiss: null, se: null, de: null, activeMatches: null };
+        }
+
         function getSwissState() {
+            if (_computeCache.swiss) return _computeCache.swiss;
+            const result = computeSwissState();
+            _computeCache.swiss = result;
+            return result;
+        }
+
+        function computeSwissState() {
             let totalRounds = Math.ceil(Math.log2(players.length)) || 1;
             let state = { rounds: [] };
             if (players.length === 0) return state;
@@ -2266,6 +2301,13 @@
         }
 
         function getSEState() {
+            if (_computeCache.se) return _computeCache.se;
+            const result = computeSEState();
+            _computeCache.se = result;
+            return result;
+        }
+
+        function computeSEState() {
             let tree = getBracketSeededTree();
             let power = tree.length;
             if (power === 0) return { rounds: [] };
@@ -2296,6 +2338,13 @@
         }
 
         function getDEState() {
+            if (_computeCache.de) return _computeCache.de;
+            const result = computeDEState();
+            _computeCache.de = result;
+            return result;
+        }
+
+        function computeDEState() {
             let tree = getBracketSeededTree();
             let power = tree.length;
             let state = { winners: [], losers: [], gf: [], gfReset: [], triggersReset: false, firstPlace: "TBD 1st Place", secondPlace: "TBD 2nd Place", thirdPlace: "TBD 3rd Place", fourthPlace: "TBD 4th Place" };
@@ -2610,12 +2659,19 @@
         window.updateScore = function(matchId, key, value) {
             if(!matchScores[matchId]) return;
             matchScores[matchId][key] = parseInt(value, 10);
-            autoSaveState();
             buildAndRender(false);
+            autoSaveState();
             if(document.getElementById('tree-modal').style.display === 'flex') openTreeModal();
         }
 
         function getAllActiveMatches() {
+            if (_computeCache.activeMatches) return _computeCache.activeMatches;
+            const activeMatches = computeAllActiveMatches();
+            _computeCache.activeMatches = activeMatches;
+            return activeMatches;
+        }
+
+        function computeAllActiveMatches() {
             let activeMatches = [];
             if (currentFormat === 'rr') {
                 let list = players.map(p => p.name);
@@ -3090,9 +3146,26 @@
         window.closeModal = function() { document.getElementById('analytics-modal').style.display = 'none'; }
         
         window.removePlayer = function(name) {
-            if (confirm(`Remove "${name}"?`)) {
+            // Swiss/SE/DE match IDs encode bracket/pairing POSITION (e.g. "se_r0_m3"),
+            // not player identity. Removing a player reshapes the seeded bracket (or the
+            // live Swiss pairing pool), so a position that used to be "Alice vs Bob" can
+            // become "Carol vs Dave" after the removal while keeping the same match ID.
+            // getMatchScore() would then hand back Alice/Bob's old score as if it belonged
+            // to Carol/Dave. Round Robin is unaffected because its match IDs are built
+            // from the sorted player names themselves, so they stay correctly attached.
+            const bracketShapeChanges = (currentFormat === 'swiss' || currentFormat === 'se' || currentFormat === 'de');
+            const message = bracketShapeChanges
+                ? `Remove "${name}"?\n\nThis format's bracket/pairings are rebuilt from the remaining players, so all recorded scores for this tournament will be cleared to prevent results being misattributed to the wrong matchup.`
+                : `Remove "${name}"?`;
+
+            if (confirm(message)) {
                 players = players.filter(p => p.name !== name);
-                autoSaveState(); buildAndRender(true);
+                if (bracketShapeChanges) {
+                    matchScores = {};
+                    finalResultsShownFor = null;
+                }
+                buildAndRender(true);
+                autoSaveState();
             }
         }
 
@@ -3100,7 +3173,8 @@
             if (confirm("Reset all logged match metrics scores?")) {
                 matchScores = {};
                 finalResultsShownFor = null;
-                autoSaveState(); buildAndRender();
+                buildAndRender();
+                autoSaveState();
             }
         }
 
